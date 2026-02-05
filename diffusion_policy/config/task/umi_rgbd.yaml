@@ -1,0 +1,93 @@
+name: umi_rgbd
+
+camera_obs_latency: 0.125
+robot_obs_latency: 0.0001
+gripper_obs_latency: 0.02
+dataset_frequeny: 0 #59.94
+obs_down_sample_steps: 1 # 1 for small datasets, 3 for full-size datasets
+
+low_dim_obs_horizon: 2
+img_obs_horizon: 2
+action_horizon: 16
+ignore_proprioception: False
+
+# Depth normalization
+max_depth: 10.0  # meters
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, depth, low_dim
+  obs:
+    camera0_rgb:
+      shape: [3, 224, 224]
+      horizon: ${task.img_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: rgb
+      ignore_by_policy: False
+    camera0_depth:
+      shape: [1, 224, 224]
+      horizon: ${task.img_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: depth
+      ignore_by_policy: False
+    robot0_eef_pos:
+      shape: [3]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'}
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'}
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      rotation_rep: rotation_6d
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_gripper_width:
+      shape: [1]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.gripper_obs_latency}) * ${task.dataset_frequeny}'}
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle_wrt_start:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon}
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'}
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+  action: 
+    shape: [10]
+    horizon: ${task.action_horizon}
+    latency_steps: 0
+    down_sample_steps: ${task.obs_down_sample_steps}
+    rotation_rep: rotation_6d
+
+task_name: &task_name umi_rgbd
+dataset_path: example_demo_session/dataset_20260203_211022.zarr.zip
+pose_repr: &pose_repr
+  obs_pose_repr: relative
+  action_pose_repr: relative
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.umi_rgbd_dataset.UmiRGBDDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  cache_dir: null
+  pose_repr: *pose_repr
+  action_padding: False
+  temporally_independent_normalization: False
+  repeat_frame_prob: 0.0
+  max_duration: null
+  seed: 42
+  val_ratio: 0.05
+  max_depth: ${task.max_depth}

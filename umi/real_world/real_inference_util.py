@@ -89,6 +89,39 @@ def get_real_umi_obs_dict(
                     out_imgs = out_imgs.astype(np.float32) / 255
             # THWC to TCHW
             obs_dict_np[key] = np.moveaxis(out_imgs,-1,1)
+        elif type == 'depth':
+            # Handle depth images - skip if not provided in env_obs
+            if key not in env_obs:
+                print(f"Warning: {key} not in env_obs, skipping depth observation")
+                continue
+                
+            this_depth_in = env_obs[key]
+            co, ho, wo = shape  # Expected shape: (1, H, W)
+            
+            # Handle different input shapes
+            if this_depth_in.ndim == 3:
+                # Input is (T, H, W)
+                t, hi, wi = this_depth_in.shape
+            elif this_depth_in.ndim == 4:
+                # Input is (T, H, W, 1) - squeeze the channel
+                t, hi, wi, ci = this_depth_in.shape
+                assert ci == 1
+                this_depth_in = this_depth_in.squeeze(-1)  # (T, H, W)
+            else:
+                raise ValueError(f"Unexpected depth shape: {this_depth_in.shape}")
+            
+            out_depth = this_depth_in.astype(np.float32)
+            
+            # Resize if needed
+            if (ho != hi) or (wo != wi):
+                import cv2
+                resized = []
+                for d in out_depth:
+                    resized.append(cv2.resize(d, (wo, ho), interpolation=cv2.INTER_LINEAR))
+                out_depth = np.stack(resized)
+            
+            # Add channel dimension: (T, H, W) -> (T, 1, H, W)
+            obs_dict_np[key] = out_depth[:, np.newaxis, :, :]
         elif type == 'low_dim' and ('eef' not in key):
             this_data_in = env_obs[key]
             obs_dict_np[key] = this_data_in
