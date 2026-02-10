@@ -10,11 +10,14 @@ shape_meta: ${task.shape_meta}
 exp_name: "default"
 
 n_action_steps: 8
+n_obs_steps: 2
 
 policy:
   _target_: diffusion_policy.policy.diffusion_unet_rgbd_policy.DiffusionUnetRGBDPolicy
 
   shape_meta: ${shape_meta}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
   
   noise_scheduler:
     _target_: diffusers.DDIMScheduler

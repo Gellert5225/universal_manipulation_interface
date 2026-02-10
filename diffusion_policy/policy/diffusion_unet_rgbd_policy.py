@@ -32,6 +32,8 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
             obs_encoder: RGBDObsEncoder,
+            n_action_steps: int = 8,
+            n_obs_steps: int = 2,
             num_inference_steps=None,
             obs_as_global_cond=True,
             diffusion_step_embed_dim=256,
@@ -45,7 +47,7 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
             **kwargs
         ):
         super().__init__()
-
+        print(f"Initializing DiffusionUnetRGBDPolicy with obs_as_global_cond={obs_as_global_cond}, input_pertub={input_pertub}, inpaint_fixed_action_prefix={inpaint_fixed_action_prefix}, train_diffusion_n_samples={train_diffusion_n_samples}")
         # parse shapes
         action_shape = shape_meta['action']['shape']
         assert len(action_shape) == 1
@@ -78,6 +80,8 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
         self.obs_feature_dim = obs_feature_dim
         self.action_dim = action_dim
         self.action_horizon = action_horizon
+        self._n_action_steps = n_action_steps
+        self._n_obs_steps = n_obs_steps
         self.obs_as_global_cond = obs_as_global_cond
         self.input_pertub = input_pertub
         self.inpaint_fixed_action_prefix = inpaint_fixed_action_prefix
@@ -138,6 +142,7 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
         """
         assert 'past_action' not in obs_dict # not implemented yet
         
+        print("Predicting action with DiffusionUnetRGBDPolicy...")
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
         B = next(iter(nobs.values())).shape[0]
@@ -171,8 +176,13 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
         assert nsample.shape == (B, self.action_horizon, self.action_dim)
         action_pred = self.normalizer['action'].unnormalize(nsample)
 
+        # Slice to n_action_steps (matching image policy behavior)
+        start = self.n_obs_steps - 1
+        end = start + self.n_action_steps
+        action = action_pred[:, start:end]
+
         result = {
-            'action': action_pred,
+            'action': action,
             'action_pred': action_pred,
         }
         return result
@@ -246,4 +256,8 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
 
     @property
     def n_obs_steps(self):
-        return self.obs_encoder.shape_meta['obs']['camera0_rgb']['horizon']
+        return self._n_obs_steps
+    
+    @property
+    def n_action_steps(self):
+        return self._n_action_steps
