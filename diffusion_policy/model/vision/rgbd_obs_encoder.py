@@ -240,23 +240,40 @@ class RGBDObsEncoder(ModuleAttrMixin):
                 assert image_shape is None or image_shape == shape[1:]
                 image_shape = shape[1:]
         
-        # Create transforms
-        if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
-            assert transforms[0].type == 'RandomCrop'
-            ratio = transforms[0].ratio
-            transforms = [
-                torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
-                torchvision.transforms.Resize(size=image_shape[0], antialias=True)
-            ] + transforms[1:]
-        transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
+        # Store config for synchronized transforms
+        self.imagenet_norm = imagenet_norm
+        self.crop_ratio = None
+        self.image_size = image_shape[0] if image_shape else 224
         
-        # Depth transform (only geometric, no color jitter)
-        depth_transform = nn.Identity()
-        if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
-            depth_transform = torch.nn.Sequential(
-                torchvision.transforms.RandomCrop(size=int(image_shape[0] * transforms[0].ratio)),
-                torchvision.transforms.Resize(size=image_shape[0], antialias=True)
+        # Create transforms list (geometric + color augmentation for RGB)
+        # Note: We'll apply geometric transforms manually in forward() for synchronization
+        rgb_color_transforms = []
+        if transforms is not None:
+            if not isinstance(transforms[0], torch.nn.Module):
+                assert transforms[0].type == 'RandomCrop'
+                self.crop_ratio = transforms[0].ratio
+                # Skip the RandomCrop config, keep rest (ColorJitter, etc.)
+                rgb_color_transforms = [t for t in transforms[1:] if isinstance(t, torch.nn.Module)]
+            else:
+                # Already module transforms - filter to color-only
+                for t in transforms:
+                    if isinstance(t, (torchvision.transforms.ColorJitter,)):
+                        rgb_color_transforms.append(t)
+        
+        # Add ImageNet normalization if enabled (required for pretrained ViT!)
+        if imagenet_norm:
+            rgb_color_transforms.append(
+                torchvision.transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], 
+                    std=[0.229, 0.224, 0.225]
+                )
             )
+        
+        # RGB transform: color jitter + imagenet norm (geometric done in forward())
+        transform = nn.Identity() if len(rgb_color_transforms) == 0 else torch.nn.Sequential(*rgb_color_transforms)
+        
+        # Depth transform: no color jitter, no imagenet norm (geometric done in forward())
+        depth_transform = nn.Identity()
         
         # Process shape_meta
         for key, attr in obs_shape_meta.items():
@@ -324,12 +341,13 @@ class RGBDObsEncoder(ModuleAttrMixin):
         # Fusion layer for 'late' fusion
         if fusion_method == 'late':
             total_feature_dim = rgb_feature_dim + depth_feature_dim
+            # Keep full dimension to preserve depth information
             self.fusion_layer = nn.Sequential(
-                nn.Linear(total_feature_dim, rgb_feature_dim),
+                nn.Linear(total_feature_dim, total_feature_dim),
                 nn.ReLU(),
-                nn.Linear(rgb_feature_dim, rgb_feature_dim)
+                nn.Linear(total_feature_dim, total_feature_dim)
             )
-            self.output_feature_dim = rgb_feature_dim
+            self.output_feature_dim = total_feature_dim  # 1280 instead of 768
         elif fusion_method == 'cross_attention':
             self.cross_attention = nn.MultiheadAttention(
                 embed_dim=rgb_feature_dim,
@@ -359,6 +377,31 @@ class RGBDObsEncoder(ModuleAttrMixin):
         # Default: global average pooling
         return feature.mean(dim=[2, 3])
     
+    def _apply_synchronized_geometric_transforms(self, rgb_img, depth_img):
+        """
+        Apply the same random crop and resize to both RGB and depth.
+        This ensures spatial alignment between modalities.
+        """
+        if self.crop_ratio is None or not self.training:
+            # No cropping or in eval mode - just return as-is
+            return rgb_img, depth_img
+        
+        # Get crop parameters (same for both)
+        crop_size = int(self.image_size * self.crop_ratio)
+        i, j, h, w = torchvision.transforms.RandomCrop.get_params(
+            rgb_img, output_size=(crop_size, crop_size)
+        )
+        
+        # Apply same crop to both
+        rgb_img = torchvision.transforms.functional.crop(rgb_img, i, j, h, w)
+        rgb_img = torchvision.transforms.functional.resize(rgb_img, [self.image_size, self.image_size], antialias=True)
+        
+        if depth_img is not None:
+            depth_img = torchvision.transforms.functional.crop(depth_img, i, j, h, w)
+            depth_img = torchvision.transforms.functional.resize(depth_img, [self.image_size, self.image_size], antialias=True)
+        
+        return rgb_img, depth_img
+    
     def forward(self, obs_dict):
         features = list()
         batch_size = next(iter(obs_dict.values())).shape[0]
@@ -368,26 +411,54 @@ class RGBDObsEncoder(ModuleAttrMixin):
         B = batch_size
         T = 1  # Default, will be updated
         
-        # Process RGB inputs
+        # Collect all RGB and depth images first
+        rgb_images = {}
+        depth_images = {}
+        
         for key in self.rgb_keys:
             img = obs_dict[key]
-            
-            # Handle both [B, T, C, H, W] and [B*T, C, H, W] input formats
             if len(img.shape) == 5:
-                # Input is [B, T, C, H, W]
                 B, T = img.shape[:2]
-                assert img.shape[2:] == self.key_shape_map[key], f"Shape mismatch for {key}: {img.shape[2:]} vs {self.key_shape_map[key]}"
                 img = img.reshape(B*T, *img.shape[2:])
             elif len(img.shape) == 4:
-                # Input is already [B*T, C, H, W] - infer B and T
                 BT = img.shape[0]
-                assert img.shape[1:] == self.key_shape_map[key], f"Shape mismatch for {key}: {img.shape[1:]} vs {self.key_shape_map[key]}"
                 B = batch_size
                 T = BT // B
-            else:
-                raise ValueError(f"Unexpected shape for {key}: {img.shape}")
+            rgb_images[key] = img
+        
+        for key in self.depth_keys:
+            if key not in obs_dict:
+                continue
+            depth = obs_dict[key]
+            if len(depth.shape) == 5:
+                B, T = depth.shape[:2]
+                depth = depth.reshape(B*T, *depth.shape[2:])
+            elif len(depth.shape) == 4:
+                BT = depth.shape[0]
+                B = batch_size
+                T = BT // B
+            depth_images[key] = depth
+        
+        # Apply synchronized geometric transforms to paired RGB-depth
+        # Assume camera0_rgb pairs with camera0_depth, etc.
+        for rgb_key in self.rgb_keys:
+            depth_key = rgb_key.replace('_rgb', '_depth')
+            rgb_img = rgb_images[rgb_key]
+            depth_img = depth_images.get(depth_key)
             
+            # Apply same random crop to both
+            rgb_img, depth_img = self._apply_synchronized_geometric_transforms(rgb_img, depth_img)
+            rgb_images[rgb_key] = rgb_img
+            if depth_img is not None and depth_key in depth_images:
+                depth_images[depth_key] = depth_img
+        
+        # Process RGB inputs (color transforms + encoding)
+        for key in self.rgb_keys:
+            img = rgb_images[key]
+            
+            # Apply color transforms (ColorJitter + ImageNet normalization)
             img = self.key_transform_map[key](img)
+            
             raw_feature = self.key_model_map[key](img)
             is_vit = self.rgb_model_name.startswith('vit')
             feature = self.aggregate_feature(raw_feature, self.rgb_attention_pool, is_vit=is_vit)
@@ -396,29 +467,12 @@ class RGBDObsEncoder(ModuleAttrMixin):
         
         # Process depth inputs
         for key in self.depth_keys:
-            if key not in obs_dict:
-                # Skip missing depth - allows RGB-only inference with RGBD model
+            if key not in depth_images:
                 continue
-            depth = obs_dict[key]
+            depth = depth_images[key]
             
-            # Handle both [B, T, C, H, W] and [B*T, C, H, W] input formats
-            if len(depth.shape) == 5:
-                # Input is [B, T, C, H, W]
-                B, T = depth.shape[:2]
-                assert depth.shape[2:] == self.key_shape_map[key], f"Shape mismatch for {key}: {depth.shape[2:]} vs {self.key_shape_map[key]}"
-                depth = depth.reshape(B*T, *depth.shape[2:])
-            elif len(depth.shape) == 4:
-                # Input is already [B*T, C, H, W] - infer B and T
-                BT = depth.shape[0]
-                assert depth.shape[1:] == self.key_shape_map[key], f"Shape mismatch for {key}: {depth.shape[1:]} vs {self.key_shape_map[key]}"
-                B = batch_size
-                T = BT // B
-            else:
-                raise ValueError(f"Unexpected shape for {key}: {depth.shape}")
-            
-            depth = self.key_transform_map[key](depth)
+            # No color transforms for depth, just encode
             raw_feature = self.key_model_map[key](depth)
-            # Depth encoder is always CNN (not ViT)
             feature = self.aggregate_feature(raw_feature, self.depth_attention_pool, is_vit=False)
             assert len(feature.shape) == 2 and feature.shape[0] == B * T, f"Depth feature shape: {feature.shape}, expected ({B*T}, ?)"
             depth_features.append(feature.reshape(B, T, -1))

@@ -41,7 +41,6 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
             **kwargs
         ):
         super().__init__()
-        print(f"Initializing DiffusionUnetRGBDPolicy with obs_as_global_cond={obs_as_global_cond}, input_pertub={input_pertub}, inpaint_fixed_action_prefix={inpaint_fixed_action_prefix}, train_diffusion_n_samples={train_diffusion_n_samples}")
         # parse shapes
         action_shape = shape_meta['action']['shape']
         assert len(action_shape) == 1
@@ -136,7 +135,6 @@ class DiffusionUnetRGBDPolicy(BaseImagePolicy):
         """
         assert 'past_action' not in obs_dict # not implemented yet
         
-        print("Predicting action with DiffusionUnetRGBDPolicy...")
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
         B = next(iter(nobs.values())).shape[0]
